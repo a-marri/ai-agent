@@ -3,7 +3,7 @@ from mistralai import Mistral
 import discord
 
 MISTRAL_MODEL = "mistral-large-latest"
-SYSTEM_PROMPT = "You are a helpful assistant."
+SYSTEM_PROMPT = "You are a helpful assistant. Make all responses about stories only 4-5 sentances long"
 
 
 class MistralAgent:
