@@ -632,154 +632,89 @@ class MafiaGame:
 
     async def setup_channels(self, ctx):
         """Set up all necessary channels for the game"""
-        # Delete existing category and channels if they exist
-        existing_category = discord.utils.get(ctx.guild.categories, name='mafia-game-channels')
-        if existing_category:
-            for channel in existing_category.channels:
-                await channel.delete()
-            await existing_category.delete()
+        try:
+            print("\n=== STARTING CHANNEL SETUP ===")
+            print("\nCurrent Players and Roles:")
+            print("---------------------------")
+            for pid, role in self.player_roles.items():
+                player = self.players.get(pid)
+                is_npc = pid >= self.npc_base_id
+                if player:
+                    print(f"Player: {player.name} | ID: {pid} | Role: {role.value} | {'NPC' if is_npc else 'Human'}")
 
-        # Create new category for game channels
-        category = await ctx.guild.create_category('mafia-game-channels', 
-            overwrites={
-                ctx.guild.default_role: discord.PermissionOverwrite(read_messages=False, send_messages=False),
-                ctx.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-            }
-        )
+            # Delete existing category and channels
+            existing_category = discord.utils.get(ctx.guild.categories, name='mafia-game-channels')
+            if existing_category:
+                print("\nDeleting existing channels...")
+                for channel in existing_category.channels:
+                    await channel.delete()
+                await existing_category.delete()
 
-        # Store channels for special roles
-        mafia_channel = None
-        detective_channel = None
-        doctor_channel = None
+            # Create new category
+            print("\nCreating new category...")
+            category = await ctx.guild.create_category('mafia-game-channels')
+            await category.set_permissions(ctx.guild.default_role, read_messages=False, send_messages=False)
+            await category.set_permissions(ctx.guild.me, read_messages=True, send_messages=True)
 
-        # Create channels for each role
-        for role in [PlayerRole.MAFIA, PlayerRole.DETECTIVE, PlayerRole.DOCTOR, PlayerRole.VILLAGER]:
-            channel_name = f"{role.value.lower()}-chat"
+            # Create channels dictionary
+            channels = {}
             
-            # Create channel with default permissions
-            channel = await ctx.guild.create_text_channel(
-                channel_name,
-                category=category,
-                overwrites={
-                    ctx.guild.default_role: discord.PermissionOverwrite(read_messages=False, send_messages=False),
-                    ctx.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-                }
-            )
-
-            # Find all players with this role
-            members = []
-            for player_id, player_role in self.player_roles.items():
-                if player_role == role and player_id < self.npc_base_id:  # Skip NPCs
-                    player = self.players[player_id]
-                    if isinstance(player, discord.Member):
-                        members.append(player)
-
-            # Store channels for special roles
-            if role == PlayerRole.MAFIA:
-                mafia_channel = channel
-            elif role == PlayerRole.DETECTIVE:
-                detective_channel = channel
-            elif role == PlayerRole.DOCTOR:
-                doctor_channel = channel
-
-            # Grant access to all players with this role
-            for member in members:
-                await channel.set_permissions(member, read_messages=True, send_messages=True)
-
-            # Only send welcome message if there are members
-            if members:
+            print("\nSetting up role-specific channels:")
+            print("--------------------------------")
+            
+            # Create each role channel
+            for role in [PlayerRole.MAFIA, PlayerRole.DETECTIVE, PlayerRole.DOCTOR, PlayerRole.VILLAGER]:
+                print(f"\n{role.value} Channel Setup:")
+                print("-" * (len(role.value) + 14))
+                
+                # Create the channel
+                channel_name = f"{role.value.lower()}-chat"
+                channel = await ctx.guild.create_text_channel(channel_name, category=category)
+                channels[role] = channel
+                print(f"Created channel: {channel_name}")
+                
+                # Set default permissions
+                await channel.set_permissions(ctx.guild.default_role, read_messages=False, send_messages=False)
+                await channel.set_permissions(ctx.guild.me, read_messages=True, send_messages=True)
+                
+                # Track who gets added to this channel
+                added_players = []
+                
+                # Find all human players with this role
+                for player_id, player_role in self.player_roles.items():
+                    if player_role == role and player_id < self.npc_base_id:
+                        player = self.players.get(player_id)
+                        if isinstance(player, discord.Member):
+                            print(f"→ Adding {player.name} (ID: {player_id}) to {channel_name}")
+                            await channel.set_permissions(player, read_messages=True, send_messages=True)
+                            added_players.append(player.name)
+                
+                if added_players:
+                    print(f"✓ Players with access to {channel_name}: {', '.join(added_players)}")
+                else:
+                    print(f"! No human players added to {channel_name}")
+                
+                # Send welcome message
+                welcome_msg = None
                 if role == PlayerRole.MAFIA:
-                    mafia_msg = "🎭 **Welcome to the Mafia Chat!** 🎭\n\n"
-                    mafia_msg += f"**Members:** {', '.join(member.name for member in members)}\n\n"
-                    mafia_msg += "**Instructions:**\n"
-                    mafia_msg += "1. Use this chat to coordinate with your fellow mafia members\n"
-                    mafia_msg += "2. During night phase, vote in the poll to choose who to eliminate\n"
-                    mafia_msg += "3. Discuss with your team before voting\n"
-                    mafia_msg += "4. During the day, act natural in the main chat and try not to get caught!\n"
+                    welcome_msg = "🎭 Welcome to the Mafia chat! Use this channel to coordinate your actions."
                 elif role == PlayerRole.DETECTIVE:
-                    detective_msg = "🔍 **Welcome to the Detective Chat!** 🔍\n\n"
-                    detective_msg += f"**Members:** {', '.join(member.name for member in members)}\n\n"
-                    detective_msg += "**Instructions:**\n"
-                    detective_msg += "1. Use the detective-chat channel to coordinate with other detectives\n"
-                    detective_msg += "2. During night phase, vote in the poll to choose who to investigate\n"
-                    detective_msg += "3. Share your findings with other detectives\n"
-                    detective_msg += "4. Be strategic about revealing information in the main chat\n"
+                    welcome_msg = "🔍 Welcome to the Detective chat! Use this channel to discuss your investigations."
                 elif role == PlayerRole.DOCTOR:
-                    doctor_msg = "💉 **Welcome to the Doctor Chat!** 💉\n\n"
-                    doctor_msg += f"**Members:** {', '.join(member.name for member in members)}\n\n"
-                    doctor_msg += "**Instructions:**\n"
-                    doctor_msg += "1. Use the doctor-chat channel to coordinate with other doctors\n"
-                    doctor_msg += "2. During night phase, vote in the poll to choose who to protect\n"
-                    doctor_msg += "3. You can protect yourself, but choose wisely!\n"
-                    doctor_msg += "4. Consider protecting players who seem to have important information\n"
+                    welcome_msg = "💉 Welcome to the Doctor chat! Use this channel to plan who to protect."
                 elif role == PlayerRole.VILLAGER:
-                    villager_msg = "🏠 **Welcome to the Villager Chat!** 🏠\n\n"
-                    villager_msg += f"**Members:** {', '.join(member.name for member in members)}\n\n"
-                    villager_msg += "**Instructions:**\n"
-                    villager_msg += "1. Use the villager-chat channel to coordinate with fellow villagers\n"
-                    villager_msg += "2. During the day, discuss who might be the mafia\n"
-                    villager_msg += "3. Vote wisely during the voting phase!\n"
-                    villager_msg += "4. Pay attention to player behavior and voting patterns\n"
-                await channel.send(villager_msg)
+                    welcome_msg = "🏠 Welcome to the Villager chat! Use this channel to discuss your suspicions."
+                
+                if welcome_msg:
+                    await channel.send(welcome_msg)
 
-        # Store special role channels
-        self.mafia_channel = mafia_channel
-        self.detective_channel = detective_channel
-        self.doctor_channel = doctor_channel
+            print("\n=== CHANNEL SETUP COMPLETE ===")
+            return channels
 
-        # Create individual private channels for each player
-        for player_id, role in self.player_roles.items():
-            if player_id >= self.npc_base_id:  # Skip NPCs
-                continue
-
-            player = self.players[player_id]
-            if not isinstance(player, discord.Member):  # Skip if not a real Discord member
-                continue
-
-            # Create private channel name
-            channel_name = f"private-{player.name.lower()}"
-
-            # Create private channel with proper permissions
-            channel = await ctx.guild.create_text_channel(
-                channel_name,
-                category=category,
-                overwrites={
-                    ctx.guild.default_role: discord.PermissionOverwrite(read_messages=False, send_messages=False),
-                    ctx.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-                    player: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-                }
-            )
-
-            # Send private welcome message
-            private_msg = f"🎭 **Welcome {player.name}!** 🎭\n\n"
-            private_msg += f"Your role is: **{role.value}**\n\n"
-            private_msg += "This is your private channel. You will receive important game updates here.\n\n"
-
-            if role == PlayerRole.MAFIA:
-                private_msg += "**Instructions:**\n"
-                private_msg += "1. Use the mafia-chat channel to coordinate with your team\n"
-                private_msg += "2. During night phase, vote in the poll to choose who to eliminate\n"
-                private_msg += "3. Discuss with your team before voting\n"
-                private_msg += "4. During the day, act natural in the main chat and try not to get caught!\n"
-            elif role == PlayerRole.DETECTIVE:
-                private_msg += "**Instructions:**\n"
-                private_msg += "1. Use the detective-chat channel to coordinate with other detectives\n"
-                private_msg += "2. During night phase, vote in the poll to choose who to investigate\n"
-                private_msg += "3. Share your findings with other detectives\n"
-                private_msg += "4. Be strategic about revealing information in the main chat\n"
-            elif role == PlayerRole.DOCTOR:
-                private_msg += "**Instructions:**\n"
-                private_msg += "1. Use the doctor-chat channel to coordinate with other doctors\n"
-                private_msg += "2. During night phase, vote in the poll to choose who to protect\n"
-                private_msg += "3. You can protect yourself, but choose wisely!\n"
-                private_msg += "4. Consider protecting players who seem to have important information\n"
-            elif role == PlayerRole.VILLAGER:
-                private_msg += "**Instructions:**\n"
-                private_msg += "1. Use the villager-chat channel to coordinate with fellow villagers\n"
-                private_msg += "2. During the day, discuss who might be the mafia\n"
-                private_msg += "3. Vote wisely during the voting phase!\n"
-                private_msg += "4. Pay attention to player behavior and voting patterns\n"
-            await channel.send(private_msg)
+        except Exception as e:
+            print(f"\n!!! ERROR IN CHANNEL SETUP: {str(e)}")
+            traceback.print_exc()
+            raise
 
     async def begin_game(self, ctx):
         """Begin the game with current players"""
@@ -790,7 +725,7 @@ class MafiaGame:
         if len(self.players) < 1:  # Allow starting with at least 1 real player
             await ctx.send("Not enough players to start! Need at least 1 player.")
             return
-
+        
         try:
             # Store the main channel
             self.main_channel = ctx.channel
@@ -827,7 +762,11 @@ class MafiaGame:
 
             # Set up channels
             await ctx.send("Setting up channels...")
-            await self.setup_channels(ctx)
+            channels = await self.setup_channels(ctx)
+
+            self.mafia_channel = channels[PlayerRole.MAFIA]
+            self.detective_channel = channels[PlayerRole.DETECTIVE]
+            self.doctor_channel = channels[PlayerRole.DOCTOR]
 
             self.state = GameState.NIGHT
 
