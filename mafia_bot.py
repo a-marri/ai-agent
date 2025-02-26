@@ -636,11 +636,14 @@ class MafiaGame:
             print("\n=== STARTING CHANNEL SETUP ===")
             print("\nCurrent Players and Roles:")
             print("---------------------------")
+            human_players = []
             for pid, role in self.player_roles.items():
                 player = self.players.get(pid)
-                is_npc = pid >= self.npc_base_id
+                is_npc = isinstance(player, NPCPlayer)
                 if player:
                     print(f"Player: {player.name} | ID: {pid} | Role: {role.value} | {'NPC' if is_npc else 'Human'}")
+                    if isinstance(player, discord.Member):
+                        human_players.append(player)
 
             # Delete existing category and channels
             existing_category = discord.utils.get(ctx.guild.categories, name='mafia-game-channels')
@@ -653,8 +656,14 @@ class MafiaGame:
             # Create new category
             print("\nCreating new category...")
             category = await ctx.guild.create_category('mafia-game-channels')
+            
+            # Set category permissions
             await category.set_permissions(ctx.guild.default_role, read_messages=False, send_messages=False)
             await category.set_permissions(ctx.guild.me, read_messages=True, send_messages=True)
+            
+            # Explicitly deny access to all human players at category level
+            for player in human_players:
+                await category.set_permissions(player, read_messages=False, send_messages=False)
 
             # Create channels dictionary
             channels = {}
@@ -673,21 +682,29 @@ class MafiaGame:
                 channels[role] = channel
                 print(f"Created channel: {channel_name}")
                 
-                # Set default permissions
-                await channel.set_permissions(ctx.guild.default_role, read_messages=False, send_messages=False)
-                await channel.set_permissions(ctx.guild.me, read_messages=True, send_messages=True)
+                # First deny access to all human players
+                print(f"Setting default deny permissions for all players in {channel_name}")
+                for player in human_players:
+                    await channel.set_permissions(player, read_messages=False, send_messages=False)
+                    print(f"→ Denied access for {player.name} to {channel_name}")
                 
                 # Track who gets added to this channel
                 added_players = []
                 
-                # Find all human players with this role
+                # Then grant access only to players with this role
                 for player_id, player_role in self.player_roles.items():
-                    if player_role == role and player_id < self.npc_base_id:
+                    if player_role == role:
                         player = self.players.get(player_id)
                         if isinstance(player, discord.Member):
-                            print(f"→ Adding {player.name} (ID: {player_id}) to {channel_name}")
+                            print(f"→ Granting access to {player.name} (ID: {player_id}) for {channel_name}")
                             await channel.set_permissions(player, read_messages=True, send_messages=True)
                             added_players.append(player.name)
+                            
+                            # Verify permissions
+                            perms = channel.permissions_for(player)
+                            print(f"  Permission check for {player.name}:")
+                            print(f"  - Can read messages: {perms.read_messages}")
+                            print(f"  - Can send messages: {perms.send_messages}")
                 
                 if added_players:
                     print(f"✓ Players with access to {channel_name}: {', '.join(added_players)}")
@@ -705,7 +722,7 @@ class MafiaGame:
                 elif role == PlayerRole.VILLAGER:
                     welcome_msg = "🏠 Welcome to the Villager chat! Use this channel to discuss your suspicions."
                 
-                if welcome_msg:
+                if welcome_msg and added_players:
                     await channel.send(welcome_msg)
 
             print("\n=== CHANNEL SETUP COMPLETE ===")
