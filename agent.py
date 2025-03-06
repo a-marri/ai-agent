@@ -1,10 +1,16 @@
 import os
-from mistralai import Mistral
+from mistralai.client import MistralClient
+from mistralai.models.chat_completion import ChatMessage
 import discord
 import asyncio
 import time
 from typing import Optional
 import backoff
+from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
+
+# Load environment variables
+load_dotenv()
 
 MISTRAL_MODEL = "mistral-large-latest"
 SYSTEM_PROMPT = "You are a helpful assistant. Make all responses about stories only 4-5 sentances long"
@@ -14,7 +20,8 @@ class MistralAgent:
     def __init__(self):
         MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 
-        self.client = Mistral(api_key=MISTRAL_API_KEY)
+        self.client = MistralClient(api_key=MISTRAL_API_KEY)
+        self.executor = ThreadPoolExecutor(max_workers=1)
         # More conservative limits - 3 concurrent requests max
         self.semaphore = asyncio.Semaphore(3)
         # Track request timestamps for rate limiting
@@ -63,9 +70,9 @@ class MistralAgent:
             async with self.semaphore:
                 await self._wait_for_capacity()
                 
+                # Create a chat message
                 messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": message.content},
+                    ChatMessage(role="user", content=str(message.content))  # Convert message to string
                 ]
 
                 # Record request time
@@ -73,12 +80,17 @@ class MistralAgent:
                 self.last_request_time = now
                 self.request_timestamps.append(now)
                 
-                response = await self.client.chat.complete_async(
-                    model=MISTRAL_MODEL,
-                    messages=messages,
+                # Run the API call in a thread pool to avoid blocking
+                loop = asyncio.get_event_loop()
+                chat_response = await loop.run_in_executor(
+                    self.executor,
+                    lambda: self.client.chat(
+                        model="mistral-tiny",  # Using smaller model for faster responses
+                        messages=messages
+                    )
                 )
 
-                return response.choices[0].message.content
+                return chat_response.choices[0].message.content
                 
         except Exception as e:
             print(f"Error in Mistral API call: {e}")
