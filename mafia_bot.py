@@ -210,6 +210,58 @@ class InvestigateView(View):
         select.callback = investigate_callback
         self.add_item(select)
 
+class VoteView(View):
+    def __init__(self, game, alive_players):
+        super().__init__(timeout=45)
+        self.game = game
+        
+        select = Select(
+            placeholder="Vote for who you think is the Mafia...",
+            options=[
+                discord.SelectOption(
+                    label=game.players[pid].display_name,
+                    value=str(pid)
+                ) for pid in alive_players
+            ]
+        )
+        
+        async def vote_callback(interaction):
+            if interaction.user.id not in game.alive_players:
+                await interaction.response.send_message("Only alive players can vote!", ephemeral=True)
+                return
+                
+            target_id = int(select.values[0])
+            game.current_votes[interaction.user.id] = target_id
+            
+            # Send public vote message
+            await game.main_channel.send(
+                f"🗳️ {interaction.user.display_name} voted for {game.players[target_id].display_name}!"
+            )
+            
+            # Acknowledge the vote to the user
+            await interaction.response.send_message(
+                f"Your vote has been recorded!", 
+                ephemeral=True
+            )
+            
+            # Update vote count message
+            vote_counts = {}
+            for voted_id in game.current_votes.values():
+                vote_counts[voted_id] = vote_counts.get(voted_id, 0) + 1
+            
+            vote_status = "\n".join([
+                f"{game.players[pid].display_name}: {count} votes"
+                for pid, count in vote_counts.items()
+            ])
+            
+            if not vote_status:
+                vote_status = "No votes yet"
+            
+            await game.vote_message.edit(content=f"Current Votes:\n{vote_status}")
+            
+        select.callback = vote_callback
+        self.add_item(select)
+
 class MafiaGame:
     def __init__(self, guild, channel):
         self.guild = guild
@@ -227,6 +279,7 @@ class MafiaGame:
         self.game_started = False
         self.state = GameState.WAITING
         self.current_votes = {}
+        self.vote_message = None
 
     async def begin_game(self):
         """Start the game and assign roles to players"""
@@ -512,69 +565,153 @@ class MafiaGame:
             print(f"ERROR in process_night_actions: {e}")
             print(f"Night actions at time of error: {self.night_actions}")
 
-    async def start_day_phase(self):
-        """Start the day phase of the game"""
-        self.state = GameState.DAY
-        
-        # Generate day transition story
-        day_prompt = "Create a scene describing the village coming to life as dawn breaks, with tension in the air as villagers gather to discuss the night's events."
-        day_story = await self.storyteller.generate_story(day_prompt)
-        await self.main_channel.send(day_story)
-        
-        # Move to voting phase after a short discussion period
-        await asyncio.sleep(30)
-        await self.start_voting_phase()
+    async def start_day(self):
+        """Start the day phase where players vote on who to eliminate"""
+        if await self.check_game_over():
+            return
 
-    async def night_phase(self):
+        self.state = GameState.DAY
+        self.current_votes.clear()
+        
+        # Announce day phase
+        await self.main_channel.send("☀️ It's time to vote on who you think is the Mafia!")
+        
+        # Create and send the voting view
+        view = VoteView(self, self.alive_players)
+        self.vote_message = await self.main_channel.send("Current Votes:\nNo votes yet")
+        voting_prompt = await self.main_channel.send("Choose who to vote out:", view=view)
+        
+        # Wait for votes (up to 45 seconds)
+        start_time = asyncio.get_event_loop().time()
+        while asyncio.get_event_loop().time() - start_time < 45:
+            # Check if everyone has voted
+            if len(self.current_votes) >= len(self.alive_players):
+                await self.main_channel.send("Everyone has voted! Moving on...")
+                break
+            await asyncio.sleep(1)
+        
+        # Stop the view and delete voting messages
+        view.stop()
+        await self.vote_message.delete()
+        await voting_prompt.delete()
+            
+        # Count votes and eliminate player
+        if self.current_votes:
+            vote_counts = {}
+            for voted_id in self.current_votes.values():
+                vote_counts[voted_id] = vote_counts.get(voted_id, 0) + 1
+            
+            # Find player(s) with most votes
+            max_votes = max(vote_counts.values())
+            eliminated = [pid for pid, count in vote_counts.items() if count == max_votes]
+            
+            if len(eliminated) == 1:
+                eliminated_id = eliminated[0]
+                eliminated_player = self.players[eliminated_id]
+                eliminated_role = self.player_roles[eliminated_id]
+                
+                self.alive_players.remove(eliminated_id)
+                self.dead_players.append(eliminated_id)
+                
+                await self.main_channel.send(
+                    f"The village has decided to eliminate {eliminated_player.display_name}.\n"
+                    f"They were a {eliminated_role.name}!"
+                )
+            else:
+                await self.main_channel.send(
+                    "There was a tie in the voting! No one was eliminated."
+                )
+        else:
+            await self.main_channel.send(
+                "No one voted! No one was eliminated."
+            )
+
+        if await self.check_game_over():
+            return
+            
+        await self.start_night()
+
+    async def start_night(self):
         """Start the night phase of the game"""
+        if await self.check_game_over():
+            return
+
         self.state = GameState.NIGHT
         self.night_actions.clear()
         
         # Notify all players that night has begun
         await self.main_channel.send("🌙 Night falls on the village. All players check your role channels for actions. You have 45 seconds!")
         
-        # Count how many actions we expect
-        expected_actions = 0
-        
+        # Track all voting messages to delete later
+        voting_messages = []
+        views_sent = []
+
         # Send prompts to special roles with dropdown menus
         mafia_members = [self.players[pid] for pid, role in self.player_roles.items() 
                         if role == Role.MAFIA and pid in self.alive_players]
+        detective_members = [self.players[pid] for pid, role in self.player_roles.items() 
+                           if role == Role.DETECTIVE and pid in self.alive_players]
+        doctor_members = [self.players[pid] for pid, role in self.player_roles.items() 
+                         if role == Role.DOCTOR and pid in self.alive_players]
+
+        # Send the views to each role channel
         if mafia_members:
-            expected_actions += 1
             alive_targets = [pid for pid in self.alive_players 
                            if pid not in [m.id for m in mafia_members]]
             if alive_targets:
                 view = KillView(self, alive_targets)
-                await self.mafia_channel.send("🔪 Choose your target to kill:", view=view)
-        
-        detective_members = [self.players[pid] for pid, role in self.player_roles.items() 
-                           if role == Role.DETECTIVE and pid in self.alive_players]
+                message = await self.mafia_channel.send("🔪 Choose your target to kill:", view=view)
+                views_sent.append(view)
+                voting_messages.append(message)
+
         if detective_members:
-            expected_actions += 1
             alive_targets = [pid for pid in self.alive_players 
                            if pid != detective_members[0].id]
             if alive_targets:
                 view = InvestigateView(self, alive_targets)
-                await self.detective_channel.send("🔍 Choose a player to investigate:", view=view)
-        
-        doctor_members = [self.players[pid] for pid, role in self.player_roles.items() 
-                         if role == Role.DOCTOR and pid in self.alive_players]
-        if doctor_members:
-            expected_actions += 1
-            view = ProtectView(self, self.alive_players)
-            await self.doctor_channel.send("💉 Choose a player to protect:", view=view)
+                message = await self.detective_channel.send("🔍 Choose a player to investigate:", view=view)
+                views_sent.append(view)
+                voting_messages.append(message)
 
-        # Wait for either all actions to be submitted or timeout
-        try:
-            while len(self.night_actions) < expected_actions:
-                if len(self.night_actions) >= expected_actions:
-                    break
-                await asyncio.sleep(1)
-                
-        except asyncio.TimeoutError:
-            pass
+        if doctor_members:
+            view = ProtectView(self, self.alive_players)
+            message = await self.doctor_channel.send("💉 Choose a player to protect:", view=view)
+            views_sent.append(view)
+            voting_messages.append(message)
+
+        # Wait for 45 seconds
+        await asyncio.sleep(45)
+
+        # Stop all views and delete voting messages
+        for view in views_sent:
+            view.stop()
         
-        # Process night actions and transition to day
+        for message in voting_messages:
+            await message.delete()
+
+        # Send timeout messages for roles that didn't act
+        timeout_messages = []
+        if mafia_members and not any(pid for pid, action in self.night_actions.items() 
+                                   if self.player_roles[pid] == Role.MAFIA):
+            msg = await self.mafia_channel.send("⏰ Time's up! The Mafia failed to choose a target.")
+            timeout_messages.append((msg, 5))  # Will delete after 5 seconds
+
+        if detective_members and not any(pid for pid, action in self.night_actions.items() 
+                                       if self.player_roles[pid] == Role.DETECTIVE):
+            msg = await self.detective_channel.send("⏰ Time's up! The Detective failed to investigate anyone.")
+            timeout_messages.append((msg, 5))
+
+        if doctor_members and not any(pid for pid, action in self.night_actions.items() 
+                                    if self.player_roles[pid] == Role.DOCTOR):
+            msg = await self.doctor_channel.send("⏰ Time's up! The Doctor failed to protect anyone.")
+            timeout_messages.append((msg, 5))
+
+        # Delete timeout messages after a short delay
+        for msg, delay in timeout_messages:
+            await asyncio.sleep(delay)
+            await msg.delete()
+
+        # Process whatever actions were submitted and continue to day phase
         await self.end_night()
 
     async def end_night(self):
@@ -619,9 +756,8 @@ class MafiaGame:
                 )
                 break
         
-        # Transition to day phase
-        self.state = GameState.DAY
-        # Start day phase logic here...
+        # Start day phase
+        await self.start_day()
 
     async def start_voting_phase(self):
         """Start the voting phase during the day"""
@@ -982,104 +1118,6 @@ class MafiaGame:
             elif role == Role.DOCTOR:
                 await self.doctor_channel.set_permissions(player, read_messages=True, send_messages=True)
 
-    async def start_night(self):
-        """Start the night phase of the game"""
-        self.state = GameState.NIGHT
-        self.night_actions.clear()
-        
-        # Notify all players that night has begun
-        await self.main_channel.send("🌙 Night falls on the village. All players check your role channels for actions. You have 45 seconds!")
-        
-        # Count how many actions we expect
-        expected_actions = 0
-        
-        # Send prompts to special roles with dropdown menus
-        mafia_members = [self.players[pid] for pid, role in self.player_roles.items() 
-                        if role == Role.MAFIA and pid in self.alive_players]
-        if mafia_members:
-            expected_actions += 1
-            alive_targets = [pid for pid in self.alive_players 
-                           if pid not in [m.id for m in mafia_members]]
-            if alive_targets:
-                view = KillView(self, alive_targets)
-                await self.mafia_channel.send("🔪 Choose your target to kill:", view=view)
-        
-        detective_members = [self.players[pid] for pid, role in self.player_roles.items() 
-                           if role == Role.DETECTIVE and pid in self.alive_players]
-        if detective_members:
-            expected_actions += 1
-            alive_targets = [pid for pid in self.alive_players 
-                           if pid != detective_members[0].id]
-            if alive_targets:
-                view = InvestigateView(self, alive_targets)
-                await self.detective_channel.send("🔍 Choose a player to investigate:", view=view)
-        
-        doctor_members = [self.players[pid] for pid, role in self.player_roles.items() 
-                         if role == Role.DOCTOR and pid in self.alive_players]
-        if doctor_members:
-            expected_actions += 1
-            view = ProtectView(self, self.alive_players)
-            await self.doctor_channel.send("💉 Choose a player to protect:", view=view)
-
-        # Wait for either all actions to be submitted or timeout
-        try:
-            while len(self.night_actions) < expected_actions:
-                if len(self.night_actions) >= expected_actions:
-                    break
-                await asyncio.sleep(1)
-                
-        except asyncio.TimeoutError:
-            pass
-        
-        # Process night actions and transition to day
-        await self.end_night()
-
-    async def end_night(self):
-        """Process all night actions and transition to day phase"""
-        # Process night actions in order: Doctor -> Detective -> Mafia
-        protected_player = None
-        killed_player = None
-        
-        # Process doctor's protection
-        for player_id, action in self.night_actions.items():
-            if self.player_roles[player_id] == Role.DOCTOR:
-                protected_player = action['target']
-                break
-        
-        # Process mafia's kill
-        for player_id, action in self.night_actions.items():
-            if self.player_roles[player_id] == Role.MAFIA:
-                if action['target'] != protected_player:
-                    killed_player = action['target']
-                break
-        
-        # Send night results
-        await self.main_channel.send("☀️ The sun rises on the village...")
-        
-        if killed_player:
-            player = self.players[killed_player]
-            self.alive_players.remove(killed_player)
-            self.dead_players.append(killed_player)
-            await self.main_channel.send(f"😱 {player.display_name} was killed during the night!")
-        else:
-            await self.main_channel.send("😌 Nobody died during the night.")
-        
-        # Process detective's investigation (only send to detective)
-        for player_id, action in self.night_actions.items():
-            if self.player_roles[player_id] == Role.DETECTIVE:
-                target_id = action['target']
-                target_role = self.player_roles[target_id]
-                detective = self.players[player_id]
-                await self.detective_channel.send(
-                    f"🔍 Your investigation reveals that {self.players[target_id].display_name} "
-                    f"is a {target_role.name}!"
-                )
-                break
-        
-        # Transition to day phase
-        self.state = GameState.DAY
-        # Start day phase logic here...
-
     async def handle_kill_command(self, ctx, target_name):
         """Handle the kill command from mafia members"""
         if self.state != GameState.NIGHT:
@@ -1177,6 +1215,57 @@ class MafiaGame:
             'target': target_id
         }
         await ctx.send(f"You have chosen to investigate {target_name}")
+
+    async def check_game_over(self):
+        """Check if the game is over and announce winner if so"""
+        # Count alive mafia and villagers
+        alive_mafia = sum(1 for pid in self.alive_players if self.player_roles[pid] == Role.MAFIA)
+        alive_villagers = len(self.alive_players) - alive_mafia  # All non-mafia are counted as villagers
+
+        # Check win conditions
+        if alive_mafia >= alive_villagers:
+            await self.main_channel.send("🎭 Game Over! The Mafia have won!")
+            self.state = GameState.ENDED
+            await self.cleanup_game()
+            return True
+        elif alive_mafia == 0:
+            await self.main_channel.send("🎉 Game Over! The Villagers have won!")
+            self.state = GameState.ENDED
+            await self.cleanup_game()
+            return True
+        return False
+
+    async def cleanup_game(self):
+        """Clean up after game end"""
+        # Print out all player roles
+        role_reveal = "📜 **Final Role List:**\n"
+        for player_id, role in self.player_roles.items():
+            player = self.players[player_id]
+            status = "☠️ Dead" if player_id in self.dead_players else "😊 Survived"
+            role_reveal += f"{player.display_name}: {role.name} ({status})\n"
+        
+        await self.main_channel.send(role_reveal)
+        
+        # Delete role channels
+        if self.mafia_channel:
+            await self.mafia_channel.delete()
+        if self.detective_channel:
+            await self.detective_channel.delete()
+        if self.doctor_channel:
+            await self.doctor_channel.delete()
+            
+        # Delete the category if it exists
+        category = self.mafia_channel.category if self.mafia_channel else None
+        if category:
+            await category.delete()
+            
+        # Reset game state
+        self.reset_game_state()
+        
+        # Send final message with updated command
+        await self.main_channel.send(
+            "Game has been cleaned up. Start a new game with !startgame"
+        )
 
 @bot.command(name='vote')
 async def vote(ctx):
